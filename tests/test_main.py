@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -127,6 +128,33 @@ class PipelineTests(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_RUN_NUMBER": "2"}):
             second = main.pick_topic("")
         self.assertNotEqual(first, second)
+
+
+    def test_json_validate_failed_400_is_retried(self):
+        calls = {"count": 0}
+        body = b'{"error":{"code":"json_validate_failed","message":"Failed to generate JSON"}}'
+
+        def fake_urlopen(request, timeout=0):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise urllib.error.HTTPError(request.full_url, 400, "bad", {}, io.BytesIO(body))
+            return FakeResponse()
+
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch.object(main.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             patch.object(main.time, "sleep"), patch.object(main, "_last_request_at", 0):
+            self.assertEqual(main.groq_json("x", 100), {"ok": True})
+        self.assertEqual(calls["count"], 2)
+
+    def test_other_400_still_fails(self):
+        def fake_urlopen(request, timeout=0):
+            raise urllib.error.HTTPError(request.full_url, 400, "bad", {}, io.BytesIO(b'{"error":{"code":"invalid_api_key"}}'))
+
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch.object(main.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             patch.object(main.time, "sleep"), patch.object(main, "_last_request_at", 0):
+            with self.assertRaises(RuntimeError):
+                main.groq_json("x", 100)
 
 
 if __name__ == "__main__":
