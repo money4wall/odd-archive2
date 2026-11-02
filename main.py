@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import wave
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +25,8 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 PIXABAY_URL = "https://pixabay.com/api/videos/"
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 VOICE = os.getenv("TTS_VOICE", "en-US-GuyNeural")
+PIPER_VOICE = os.getenv("PIPER_VOICE", "en_US-ryan-high")
+VOICE_DIR = ROOT / "voices"
 SCENE_COUNT = 10
 MIN_REQUEST_INTERVAL = 12.0
 JSON_STYLE_NOTE = (
@@ -323,9 +326,52 @@ def pixabay_video(query: str, destination: Path) -> None:
         raise RuntimeError(f"Downloaded video is unexpectedly small: {destination.name}")
 
 
-async def make_voice(text: str, destination: Path) -> None:
+_edge_broken = False
+_piper_voice_obj = None
+
+
+async def edge_voice(text: str, destination: Path) -> None:
     import edge_tts
     await edge_tts.Communicate(text, VOICE, rate="-4%").save(str(destination))
+
+
+def piper_voice(text: str, destination: Path) -> None:
+    """Offline fallback voice. Needs the model downloaded into voices/ (see workflow)."""
+    global _piper_voice_obj
+    from piper import PiperVoice
+    model = VOICE_DIR / f"{PIPER_VOICE}.onnx"
+    if not model.exists():
+        raise RuntimeError(f"Piper voice model not found: {model}")
+    if _piper_voice_obj is None:
+        _piper_voice_obj = PiperVoice.load(str(model))
+    wav_path = destination.with_suffix(".wav")
+    with wave.open(str(wav_path), "wb") as wav_file:
+        _piper_voice_obj.synthesize_wav(text, wav_file)
+    run(["ffmpeg", "-y", "-i", str(wav_path), "-c:a", "libmp3lame", "-q:a", "3", str(destination)])
+    wav_path.unlink(missing_ok=True)
+
+
+async def make_voice(text: str, destination: Path) -> None:
+    """Edge TTS first; if Microsoft blocks the runner (HTTP 403), use Piper."""
+    global _edge_broken
+    edge_error: Exception | None = None
+    if not _edge_broken:
+        for attempt in range(2):
+            try:
+                await edge_voice(text, destination)
+                return
+            except Exception as exc:
+                edge_error = exc
+                log(f"Edge TTS failed (attempt {attempt + 1}/2): {str(exc)[:200]}")
+                destination.unlink(missing_ok=True)
+                if attempt == 0:
+                    await asyncio.sleep(3)
+        _edge_broken = True  # do not waste time retrying Edge for every remaining scene
+        log("Edge TTS unavailable; switching to the Piper offline voice for the rest of this run")
+    try:
+        await asyncio.to_thread(piper_voice, text, destination)
+    except Exception as exc:
+        raise RuntimeError(f"All TTS engines failed. Edge: {edge_error}; Piper: {exc}") from exc
 
 
 def ffprobe_duration(path: Path) -> float:
