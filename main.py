@@ -26,6 +26,10 @@ MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 VOICE = os.getenv("TTS_VOICE", "en-US-GuyNeural")
 SCENE_COUNT = 10
 MIN_REQUEST_INTERVAL = 12.0
+JSON_STYLE_NOTE = (
+    "Inside JSON strings use only plain ASCII punctuation: straight apostrophes, "
+    "ordinary hyphens, no curly quotes, no special dashes, and never an unescaped double quote."
+)
 _last_request_at = 0.0
 
 
@@ -99,7 +103,7 @@ def groq_json(prompt: str, max_tokens: int = 900) -> dict[str, Any]:
     if not api_key:
         raise RuntimeError("Missing GROQ_API_KEY GitHub Actions secret")
 
-    request_prompt = prompt + "\n\nOutput requirements: return exactly one valid JSON object. No markdown fences and no text outside the JSON."
+    request_prompt = prompt + "\n\nOutput requirements: return exactly one valid JSON object. No markdown fences and no text outside the JSON. " + JSON_STYLE_NOTE
     last_problem = "unknown error"
 
     for attempt in range(8):
@@ -158,6 +162,13 @@ def groq_json(prompt: str, max_tokens: int = 900) -> dict[str, Any]:
             body = exc.read().decode("utf-8", errors="replace")
             last_problem = f"Groq HTTP {exc.code}: {body[:1200]}"
             log(last_problem)
+            if exc.code == 400 and "json_validate_failed" in body:
+                # The model emitted malformed JSON and Groq rejected it. Random, so retry.
+                _last_request_at = time.monotonic()
+                request_prompt = prompt + "\n\n" + JSON_STYLE_NOTE
+                log("Model produced malformed JSON; retrying...")
+                time.sleep(3)
+                continue
             if exc.code == 429 or exc.code in (408, 500, 502, 503, 504):
                 delay = server_retry_seconds(exc.headers, body, attempt)
                 log(f"Waiting {delay:.1f}s before retry...")
