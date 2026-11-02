@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+import asyncio
 import unittest
 import urllib.error
 from pathlib import Path
@@ -155,6 +156,57 @@ class PipelineTests(unittest.TestCase):
              patch.object(main.time, "sleep"), patch.object(main, "_last_request_at", 0):
             with self.assertRaises(RuntimeError):
                 main.groq_json("x", 100)
+
+
+    def test_voice_falls_back_to_piper_when_edge_fails(self):
+        used = []
+
+        async def bad_edge(text, dest):
+            used.append("edge")
+            raise RuntimeError("403, message='Invalid response status'")
+
+        def ok_piper(text, dest):
+            used.append("piper")
+
+        async def no_sleep(_):
+            return None
+
+        with patch.object(main, "_edge_broken", False), \
+             patch.object(main, "edge_voice", bad_edge), \
+             patch.object(main, "piper_voice", ok_piper), \
+             patch.object(main.asyncio, "sleep", no_sleep):
+            asyncio.run(main.make_voice("hello", Path("/tmp/x.mp3")))
+            self.assertEqual(used, ["edge", "edge", "piper"])
+            used.clear()
+            asyncio.run(main.make_voice("hello again", Path("/tmp/x.mp3")))
+            self.assertEqual(used, ["piper"])  # Edge is skipped once marked broken
+
+    def test_voice_uses_edge_when_it_works(self):
+        used = []
+
+        async def ok_edge(text, dest):
+            used.append("edge")
+
+        with patch.object(main, "_edge_broken", False), \
+             patch.object(main, "edge_voice", ok_edge), \
+             patch.object(main, "piper_voice", side_effect=AssertionError("fallback must not run")):
+            asyncio.run(main.make_voice("hello", Path("/tmp/x.mp3")))
+        self.assertEqual(used, ["edge"])
+
+    def test_both_voices_failing_gives_clear_error(self):
+        async def bad_edge(text, dest):
+            raise RuntimeError("403")
+
+        async def no_sleep(_):
+            return None
+
+        with patch.object(main, "_edge_broken", False), \
+             patch.object(main, "edge_voice", bad_edge), \
+             patch.object(main, "piper_voice", side_effect=RuntimeError("no model")), \
+             patch.object(main.asyncio, "sleep", no_sleep):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(main.make_voice("hello", Path("/tmp/x.mp3")))
+        self.assertIn("All TTS engines failed", str(ctx.exception))
 
 
 if __name__ == "__main__":
