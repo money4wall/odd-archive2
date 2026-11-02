@@ -1,0 +1,100 @@
+name: Build ODD ARCHIVE episode
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: Documentary topic (clear the field to pick the next one from topics.txt)
+        required: false
+        default: 'Centralia, Pennsylvania: the town beneath which a mine fire still burns'
+        type: string
+  schedule:
+    - cron: '0 10 * * 2,4,6'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Restore generation progress
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/*/outline.json
+            work/*/scenes
+          key: odd-archive-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            odd-archive-${{ runner.os }}-
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache fallback voice
+        id: voice-cache
+        uses: actions/cache@v4
+        with:
+          path: voices
+          key: piper-voice-en_US-ryan-high
+
+      - name: Download fallback voice (Piper)
+        if: steps.voice-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: python -m piper.download_voices en_US-ryan-high --download-dir voices
+
+      - name: Validate project
+        run: |
+          python -m py_compile main.py upload_youtube.py
+          python -m unittest discover -s tests -v
+          python main.py --self-test
+
+      - name: Generate episode
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          GROQ_MODEL: openai/gpt-oss-20b
+          TOPIC: ${{ inputs.topic }}
+        run: python main.py
+
+      # Runs even when generation failed, so finished scenes survive the failure.
+      - name: Save generation progress
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            work/*/outline.json
+            work/*/scenes
+          key: odd-archive-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Upload finished episode
+        uses: actions/upload-artifact@v4
+        with:
+          name: odd-archive-episode
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish to YouTube (optional)
+        if: ${{ vars.AUTO_UPLOAD == 'true' }}
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          YOUTUBE_PRIVACY_STATUS: unlisted
+        run: python upload_youtube.py
